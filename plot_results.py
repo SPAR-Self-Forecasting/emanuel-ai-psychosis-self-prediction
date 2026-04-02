@@ -34,6 +34,7 @@ def compute_matrices(preds: pd.DataFrame, gt: dict):
     n = len(MODELS)
     raw_mse = np.full((n, n), np.nan)
     z_mse = np.full((n, n), np.nan)
+    spearman = np.full((n, n), np.nan)
 
     for i, pred_model in enumerate(MODELS):
         pred_sub = preds[preds['predictor_model'] == pred_model]
@@ -48,8 +49,9 @@ def compute_matrices(preds: pd.DataFrame, gt: dict):
                 predicted, actual = np.array(predicted), np.array(actual)
                 raw_mse[i, j] = np.mean((predicted - actual) ** 2)
                 z_mse[i, j] = np.mean((zscore(predicted) - zscore(actual)) ** 2)
+                spearman[i, j] = spearmanr(predicted, actual).statistic
 
-    return raw_mse, z_mse
+    return raw_mse, z_mse, spearman
 
 
 def plot_mse_heatmaps(raw_mse, z_mse):
@@ -87,6 +89,46 @@ def plot_mse_heatmaps(raw_mse, z_mse):
 
     plt.tight_layout()
     out = OUTPUT_DIR / 'self_vs_cross_plot.png'
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    print(f'Saved {out}')
+    plt.close()
+
+
+def plot_mse_and_spearman(raw_mse, spearman):
+    labels = [short(m) for m in MODELS]
+    n = len(MODELS)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle('Self-Prediction vs Cross-Prediction (5x5)', fontsize=14, fontweight='bold', y=1.02)
+
+    im1 = ax1.imshow(-raw_mse, cmap='viridis', aspect='auto')
+    ax1.set_title('Negative MSE\n(yellow = better)', fontsize=12)
+    for i in range(n):
+        for j in range(n):
+            if not np.isnan(raw_mse[i, j]):
+                ax1.text(j, i, f'{raw_mse[i,j]:.2f}', ha='center', va='center',
+                         fontsize=10, fontweight='bold' if i == j else 'normal', color='black')
+    plt.colorbar(im1, ax=ax1, shrink=0.8)
+
+    im2 = ax2.imshow(spearman, cmap='viridis', aspect='auto')
+    ax2.set_title('Spearman ρ\n(yellow = better)', fontsize=12)
+    for i in range(n):
+        for j in range(n):
+            if not np.isnan(spearman[i, j]):
+                ax2.text(j, i, f'{spearman[i,j]:.2f}', ha='center', va='center',
+                         fontsize=10, fontweight='bold' if i == j else 'normal', color='black')
+    plt.colorbar(im2, ax=ax2, shrink=0.8)
+
+    for ax in (ax1, ax2):
+        ax.set_xticks(range(n))
+        ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=10)
+        ax.set_yticks(range(n))
+        ax.set_yticklabels(labels, fontsize=10)
+        ax.set_xlabel('Target')
+        ax.set_ylabel('Predictor')
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / 'self_vs_cross_mse_spearman.png'
     plt.savefig(out, dpi=150, bbox_inches='tight')
     print(f'Saved {out}')
     plt.close()
@@ -145,8 +187,9 @@ def main():
     for _, row in gt_df.iterrows():
         gt[(row['target_model'], row['character'], row['metric_key'])] = row['ground_truth_score']
 
-    raw_mse, z_mse = compute_matrices(preds, gt)
+    raw_mse, z_mse, spearman = compute_matrices(preds, gt)
     plot_mse_heatmaps(raw_mse, z_mse)
+    plot_mse_and_spearman(raw_mse, spearman)
     plot_calibration(preds, gt_df)
 
     # Print summary
