@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Stage 2: Self-prediction vs cross-prediction experiment.
+Stage 2: Self-prediction vs cross-prediction experiment (named-model variant).
 
-For each predictor model, we ask it to predict the judge score it would
-receive on each (character, judge_metric) combination. Then we compare:
-  - Self-prediction MSE: predictor == target
-  - Cross-prediction MSE: predictor != target
+Each predictor model is told:
+  - its own name
+  - the name of the target model it is predicting
+  - the name of the judge model
+  - the character and judge criterion
 
-The same prompt is used for all models — no model names are revealed.
-Each model always predicts "how would I behave," so we only need
-  num_models × num_characters × num_metrics
-API calls. The cross-prediction matrix is built by comparing each
-predictor's forecasts against every target's actual ground truth scores.
+This means we need num_predictors × num_targets × num_characters × num_metrics
+API calls (2,475 total for 5×5×9×11).
+
+Full predictor responses (including any reasoning) are saved alongside
+the parsed score.
 """
 
 import asyncio
@@ -42,18 +43,19 @@ console = Console(width=100)
 # ---------------------------------------------------------------------------
 
 TARGET_MODELS = [
-    "openrouter/openai/gpt-5",
+    "openrouter/google/gemini-2.5-flash",
     "openrouter/openai/gpt-oss-20b",
+    "openrouter/openai/gpt-5",
     "openrouter/x-ai/grok-3",
     "openrouter/x-ai/grok-4",
-    "openrouter/google/gemini-2.5-flash",
 ]
+
+JUDGE_MODEL = "openrouter/x-ai/grok-3"
 
 MAX_CONNECTIONS = 10
 
 OUTPUT_DIR = Path(__file__).parent / "stage2_results"
 
-# Judge metrics: (key_in_csv, display_name, description, scale_text)
 JUDGE_METRICS = [
     (
         "pushback_rating",
@@ -131,11 +133,20 @@ JUDGE_METRICS = [
 
 PROMPT_TEMPLATE = (Path(__file__).parent / "stage2_prompt_template.txt").read_text()
 
+short = lambda m: m.split('/')[-1]
 
-def build_prompt(character_desc: str, metric: tuple) -> str:
-    """Fill the prompt template for one (character, metric) pair."""
+
+def build_prompt(
+    predictor_model: str,
+    target_model: str,
+    character_desc: str,
+    metric: tuple,
+) -> str:
     key, name, description, scale = metric
     return PROMPT_TEMPLATE.format(
+        predictor_model_name=short(predictor_model),
+        target_model_name=short(target_model),
+        judge_model_name=short(JUDGE_MODEL),
         character_description=character_desc,
         judge_criterion_name=name,
         judge_criterion_description=description,
@@ -144,11 +155,9 @@ def build_prompt(character_desc: str, metric: tuple) -> str:
 
 
 def parse_prediction(text: str) -> float | None:
-    """Extract numeric score from 'PREDICTION: X.X' format."""
     match = re.search(r"PREDICTION:\s*(-?\d+(?:\.\d+)?)", text)
     if match:
         return float(match.group(1))
-    # Fallback: look for any standalone number
     match = re.search(r"(-?\d+(?:\.\d+)?)", text)
     if match:
         return float(match.group(1))
@@ -161,15 +170,6 @@ def parse_prediction(text: str) -> float | None:
 
 
 def load_ground_truth(stage1_results_dir: Path) -> dict[tuple[str, str, str], float]:
-    """
-    Load Stage 1 raw results and extract ground truth scores.
-
-    For each (target_model, character, metric), the ground truth is the
-    score on the final turn (turn 12). With N>1 repetitions, it is the
-    mean score across repetitions.
-
-    Returns {(target_model, character, metric_key): score}
-    """
     raw_files = sorted(stage1_results_dir.glob("raw_results_*.csv"))
     if not raw_files:
         raise FileNotFoundError(f"No raw_results_*.csv found in {stage1_results_dir}")
@@ -177,16 +177,13 @@ def load_ground_truth(stage1_results_dir: Path) -> dict[tuple[str, str, str], fl
     console.print(f"Loading ground truth from {raw_path}")
 
     df = pd.read_csv(raw_path)
-
-    # Use only the final turn
     max_turn = df.groupby(["target_model", "patient_name"])["turn_number"].max()
     final = df.merge(max_turn.rename("max_turn"), on=["target_model", "patient_name"])
     final = final[final["turn_number"] == final["max_turn"]]
 
-    metric_keys = [m[0] for m in JUDGE_METRICS]
     result = {}
     for (model, char), group in final.groupby(["target_model", "patient_name"]):
-        for key in metric_keys:
+        for key, *_ in JUDGE_METRICS:
             if key in group.columns:
                 values = group[key].dropna()
                 if not values.empty:
@@ -203,25 +200,27 @@ def load_ground_truth(stage1_results_dir: Path) -> dict[tuple[str, str, str], fl
 
 async def get_prediction(
     predictor_model_name: str,
+    target_model_name: str,
     prompt: str,
     semaphore: asyncio.Semaphore,
-) -> float | None:
-    """Call the predictor model and parse the predicted score."""
+) -> tuple[float | None, str]:
+    """Returns (parsed_score, full_response_text)."""
     async with semaphore:
         try:
             model = get_model(predictor_model_name)
             response = await model.generate([ChatMessageUser(content=prompt)])
             score = parse_prediction(response.completion)
-            if score is not None:
-                return score
-            console.print(
-                f"  [yellow]Could not parse[/yellow] {predictor_model_name}: "
-                f"{response.completion[:120]}"
-            )
-            return None
+            if score is None:
+                console.print(
+                    f"  [yellow]Could not parse[/yellow] {short(predictor_model_name)} "
+                    f"-> {short(target_model_name)}: {response.completion[:80]}"
+                )
+            return score, response.completion
         except Exception as e:
-            console.print(f"  [red]Error[/red] {predictor_model_name}: {e}")
-            return None
+            console.print(
+                f"  [red]Error[/red] {short(predictor_model_name)} -> {short(target_model_name)}: {e}"
+            )
+            return None, ""
 
 
 async def collect_all_predictions(
@@ -229,28 +228,30 @@ async def collect_all_predictions(
     metrics: list[tuple],
 ) -> pd.DataFrame:
     """
-    For each predictor model, collect predicted scores for all (character, metric).
-
+    For each (predictor, target, character, metric), collect a prediction.
     Returns DataFrame with columns:
-      predictor_model, character, metric_key, predicted_score
+      predictor_model, target_model, character, metric_key,
+      predicted_score, full_response
     """
     semaphore = asyncio.Semaphore(MAX_CONNECTIONS)
     tasks = []
     task_keys = []
 
     for predictor in TARGET_MODELS:
-        for char_name, char_desc in characters.items():
-            for metric in metrics:
-                prompt = build_prompt(char_desc, metric)
-                tasks.append(get_prediction(predictor, prompt, semaphore))
-                task_keys.append((predictor, char_name, metric[0]))
+        for target in TARGET_MODELS:
+            for char_name, char_desc in characters.items():
+                for metric in metrics:
+                    prompt = build_prompt(predictor, target, char_desc, metric)
+                    tasks.append(get_prediction(predictor, target, prompt, semaphore))
+                    task_keys.append((predictor, target, char_name, metric[0]))
 
     total = len(tasks)
     console.print(
         Panel.fit(
             Text(
                 f"Stage 2: Collecting {total} predictions "
-                f"({len(TARGET_MODELS)} models x {len(characters)} chars x {len(metrics)} metrics)",
+                f"({len(TARGET_MODELS)} predictors x {len(TARGET_MODELS)} targets "
+                f"x {len(characters)} chars x {len(metrics)} metrics)",
                 style="bold magenta",
             ),
             border_style="magenta",
@@ -260,113 +261,76 @@ async def collect_all_predictions(
     results = await asyncio.gather(*tasks)
 
     rows = []
-    for (predictor, char, metric_key), score in zip(task_keys, results):
-        if score is not None:
-            rows.append(
-                {
-                    "predictor_model": predictor,
-                    "character": char,
-                    "metric_key": metric_key,
-                    "predicted_score": score,
-                }
-            )
+    for (predictor, target, char, metric_key), (score, full_response) in zip(task_keys, results):
+        rows.append({
+            "predictor_model": predictor,
+            "target_model": target,
+            "character": char,
+            "metric_key": metric_key,
+            "predicted_score": score,
+            "full_response": full_response,
+        })
 
     df = pd.DataFrame(rows)
-    console.print(f"Collected {len(df)} / {total} predictions")
+    parsed = df["predicted_score"].notna().sum()
+    console.print(f"Collected {parsed} / {total} predictions ({total - parsed} failed to parse)")
     return df
 
 
 # ---------------------------------------------------------------------------
-# MSE computation
+# MSE + Spearman matrix
 # ---------------------------------------------------------------------------
 
 
-def compute_mse_matrix(
+def compute_matrices(
     predictions_df: pd.DataFrame,
     ground_truth: dict[tuple[str, str, str], float],
-) -> pd.DataFrame:
+    n_jitter_iters: int = 500,
+    jitter: float = 0.001,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Compute MSE for every (predictor, target) pair.
-
-    MSE = mean over (character, metric) of (predicted_score - actual_score)^2
-
-    Each predictor's single set of predictions is compared against every
-    target's ground truth. Self-prediction = diagonal, cross = off-diagonal.
-
-    Returns DataFrame with predictor as rows, target as columns.
+    Returns (mse_df, spearman_jitter_df) with predictor as rows, target as cols.
     """
-    predictors = sorted(predictions_df["predictor_model"].unique())
-    targets = sorted(set(m for (m, _, _) in ground_truth.keys()))
+    n = len(TARGET_MODELS)
+    mse_matrix = np.full((n, n), np.nan)
+    spearman_matrix = np.full((n, n), np.nan)
 
-    matrix = {}
-    for predictor in predictors:
-        pred_subset = predictions_df[predictions_df["predictor_model"] == predictor]
+    rng = np.random.default_rng(seed)
 
-        for target in targets:
-            squared_errors = []
-            for _, row in pred_subset.iterrows():
-                gt_key = (target, row["character"], row["metric_key"])
-                if gt_key in ground_truth:
-                    se = (row["predicted_score"] - ground_truth[gt_key]) ** 2
-                    squared_errors.append(se)
+    for i, pred_model in enumerate(TARGET_MODELS):
+        for j, tgt_model in enumerate(TARGET_MODELS):
+            sub = predictions_df[
+                (predictions_df["predictor_model"] == pred_model) &
+                (predictions_df["target_model"] == tgt_model) &
+                predictions_df["predicted_score"].notna()
+            ]
+            predicted, actual = [], []
+            for _, row in sub.iterrows():
+                key = (tgt_model, row["character"], row["metric_key"])
+                if key in ground_truth:
+                    predicted.append(row["predicted_score"])
+                    actual.append(ground_truth[key])
 
-            if squared_errors:
-                matrix.setdefault(predictor, {})[target] = np.mean(squared_errors)
+            if len(predicted) > 2:
+                predicted, actual = np.array(predicted), np.array(actual)
+                mse_matrix[i, j] = np.mean((predicted - actual) ** 2)
 
-    mse_df = pd.DataFrame(matrix).T
-    mse_df.index.name = "predictor"
-    mse_df.columns.name = "target"
-    return mse_df
+                # Jittered Spearman
+                from scipy.stats import spearmanr
+                rhos = []
+                for _ in range(n_jitter_iters):
+                    p_j = predicted + rng.uniform(-jitter, jitter, size=len(predicted))
+                    a_j = actual    + rng.uniform(-jitter, jitter, size=len(actual))
+                    rhos.append(spearmanr(p_j, a_j).statistic)
+                spearman_matrix[i, j] = np.mean(rhos)
 
-
-def print_mse_summary(mse_df: pd.DataFrame) -> None:
-    """Print a summary comparing self vs cross prediction MSE."""
-    models = [m for m in mse_df.index if m in mse_df.columns]
-
-    self_scores = []
-    cross_scores = []
-    for m in models:
-        self_scores.append(mse_df.loc[m, m])
-        for m2 in models:
-            if m2 != m:
-                cross_scores.append(mse_df.loc[m, m2])
-
-    console.print("\n")
-    console.print(Panel.fit(Text("MSE Summary", style="bold cyan"), border_style="cyan"))
-    console.print(f"  Self-prediction  (diagonal) mean MSE: {np.mean(self_scores):.4f}")
-    console.print(f"  Cross-prediction (off-diag) mean MSE: {np.mean(cross_scores):.4f}")
-    console.print(
-        f"  Difference (cross - self):            {np.mean(cross_scores) - np.mean(self_scores):.4f}"
-    )
-    console.print(f"  (Positive = self-prediction is better)\n")
-
-    # Full matrix
-    console.print(Panel.fit(Text("Full MSE Matrix (predictor rows x target cols)", style="bold cyan"), border_style="cyan"))
-    short = mse_df.copy()
-    short.index = [m.split("/")[-1] for m in short.index]
-    short.columns = [m.split("/")[-1] for m in short.columns]
-    console.print(short.round(4).to_string())
-
-    # Per-model breakdown
-    table = Table(title="\nPer-model Self vs Cross MSE")
-    table.add_column("Model", style="cyan")
-    table.add_column("Self MSE", justify="right")
-    table.add_column("Cross MSE (mean)", justify="right")
-    table.add_column("Delta", justify="right")
-
-    for m in models:
-        self_s = mse_df.loc[m, m]
-        cross_s = np.mean([mse_df.loc[m, m2] for m2 in models if m2 != m])
-        delta = cross_s - self_s
-        color = "green" if delta > 0 else "red"
-        table.add_row(
-            m.split("/")[-1],
-            f"{self_s:.4f}",
-            f"{cross_s:.4f}",
-            f"[{color}]{delta:+.4f}[/{color}]",
-        )
-
-    console.print(table)
+    labels = [short(m) for m in TARGET_MODELS]
+    mse_df = pd.DataFrame(mse_matrix, index=labels, columns=labels)
+    spearman_df = pd.DataFrame(spearman_matrix, index=labels, columns=labels)
+    mse_df.index.name = spearman_df.index.name = "predictor"
+    mse_df.columns.name = spearman_df.columns.name = "target"
+    return mse_df, spearman_df
 
 
 # ---------------------------------------------------------------------------
@@ -377,27 +341,23 @@ def print_mse_summary(mse_df: pd.DataFrame) -> None:
 async def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load characters from repo
     os.chdir(REPO_DIR)
     from redteaming_systematic import load_characters
-
     characters = load_characters()
 
-    # Load ground truth from Stage 1
     stage1_dir = Path(__file__).parent / "stage1_results"
     ground_truth = load_ground_truth(stage1_dir)
 
-    # Collect predictions
     predictions_df = await collect_all_predictions(characters, JUDGE_METRICS)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Save raw predictions
+    # Save predictions (including full responses / transcripts)
     pred_path = OUTPUT_DIR / f"predictions_{timestamp}.csv"
     predictions_df.to_csv(pred_path, index=False)
-    console.print(f"[green]Predictions saved to {pred_path}[/green]")
+    console.print(f"[green]Predictions + transcripts saved to {pred_path}[/green]")
 
-    # Save ground truth for reference
+    # Save ground truth
     gt_rows = [
         {"target_model": m, "character": c, "metric_key": k, "ground_truth_score": v}
         for (m, c, k), v in ground_truth.items()
@@ -405,15 +365,32 @@ async def main():
     gt_path = OUTPUT_DIR / f"ground_truth_{timestamp}.csv"
     pd.DataFrame(gt_rows).to_csv(gt_path, index=False)
 
-    # Compute MSE matrix
-    mse_df = compute_mse_matrix(predictions_df, ground_truth)
+    # Compute matrices
+    console.print("Computing MSE and jittered Spearman matrices...")
+    mse_df, spearman_df = compute_matrices(predictions_df, ground_truth)
 
-    mse_path = OUTPUT_DIR / f"mse_matrix_{timestamp}.csv"
-    mse_df.to_csv(mse_path)
-    console.print(f"[green]MSE matrix saved to {mse_path}[/green]")
+    mse_df.to_csv(OUTPUT_DIR / f"mse_matrix_{timestamp}.csv")
+    spearman_df.to_csv(OUTPUT_DIR / f"spearman_matrix_{timestamp}.csv")
+    console.print(f"[green]Matrices saved.[/green]")
 
-    # Print summary
-    print_mse_summary(mse_df)
+    # Summary
+    n = len(TARGET_MODELS)
+    labels = [short(m) for m in TARGET_MODELS]
+    self_spearman = np.mean([spearman_df.iloc[i, i] for i in range(n)])
+    cross_spearman = np.mean([spearman_df.iloc[i, j] for i in range(n) for j in range(n) if i != j])
+    self_mse = np.mean([mse_df.iloc[i, i] for i in range(n)])
+    cross_mse = np.mean([mse_df.iloc[i, j] for i in range(n) for j in range(n) if i != j])
+
+    table = Table(title="Self vs Cross Prediction Summary")
+    table.add_column("Metric")
+    table.add_column("Self (diagonal)", justify="right")
+    table.add_column("Cross (off-diag)", justify="right")
+    table.add_column("Delta", justify="right")
+    table.add_row("Spearman ρ (jittered)", f"{self_spearman:.3f}", f"{cross_spearman:.3f}",
+                  f"{self_spearman - cross_spearman:+.3f}")
+    table.add_row("MSE", f"{self_mse:.3f}", f"{cross_mse:.3f}",
+                  f"{cross_mse - self_mse:+.3f}")
+    console.print(table)
 
     console.print("[bold green]Stage 2 complete![/bold green]")
 

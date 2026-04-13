@@ -30,52 +30,83 @@ def load_latest(directory: Path, pattern: str) -> Path:
     return files[-1]
 
 
-def compute_matrices(preds: pd.DataFrame, gt: dict):
+def compute_matrices(preds: pd.DataFrame, gt: dict, n_jitter_iters: int = 500, jitter: float = 0.001):
     n = len(MODELS)
     raw_mse = np.full((n, n), np.nan)
     z_mse = np.full((n, n), np.nan)
-    spearman = np.full((n, n), np.nan)
+    spearman_jitter = np.full((n, n), np.nan)
+    r2_matrix = np.full((n, n), np.nan)
+
+    rng = np.random.default_rng(42)
 
     for i, pred_model in enumerate(MODELS):
-        pred_sub = preds[preds['predictor_model'] == pred_model]
         for j, tgt_model in enumerate(MODELS):
-            predicted, actual = [], []
-            for _, row in pred_sub.iterrows():
-                key = (tgt_model, row['character'], row['metric_key'])
-                if key in gt:
-                    predicted.append(row['predicted_score'])
-                    actual.append(gt[key])
+            # New format: predictions have both predictor_model and target_model columns
+            if 'target_model' in preds.columns:
+                pred_sub = preds[
+                    (preds['predictor_model'] == pred_model) &
+                    (preds['target_model'] == tgt_model) &
+                    preds['predicted_score'].notna()
+                ]
+                predicted, actual = [], []
+                for _, row in pred_sub.iterrows():
+                    key = (tgt_model, row['character'], row['metric_key'])
+                    if key in gt:
+                        predicted.append(row['predicted_score'])
+                        actual.append(gt[key])
+            else:
+                # Legacy format: predictor predicts all targets from same set
+                pred_sub = preds[preds['predictor_model'] == pred_model]
+                predicted, actual = [], []
+                for _, row in pred_sub.iterrows():
+                    key = (tgt_model, row['character'], row['metric_key'])
+                    if key in gt:
+                        predicted.append(row['predicted_score'])
+                        actual.append(gt[key])
+
             if len(predicted) > 2:
                 predicted, actual = np.array(predicted), np.array(actual)
                 raw_mse[i, j] = np.mean((predicted - actual) ** 2)
                 z_mse[i, j] = np.mean((zscore(predicted) - zscore(actual)) ** 2)
-                spearman[i, j] = spearmanr(predicted, actual).statistic
+                ss_res = np.sum((actual - predicted) ** 2)
+                ss_tot = np.sum((actual - actual.mean()) ** 2)
+                r2_matrix[i, j] = 1 - ss_res / ss_tot
+                rhos = []
+                for _ in range(n_jitter_iters):
+                    p_j = predicted + rng.uniform(-jitter, jitter, size=len(predicted))
+                    a_j = actual    + rng.uniform(-jitter, jitter, size=len(actual))
+                    rhos.append(spearmanr(p_j, a_j).statistic)
+                spearman_jitter[i, j] = np.mean(rhos)
 
-    return raw_mse, z_mse, spearman
+    return raw_mse, z_mse, spearman_jitter, r2_matrix
 
 
-def plot_mse_heatmaps(raw_mse, z_mse):
+def plot_main(spearman_jitter, r2_matrix, subtitle=''):
+    """Primary plot: Spearman (jittered) left, R2 right."""
     labels = [short(m) for m in MODELS]
     n = len(MODELS)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle('Self-Prediction vs Cross-Prediction (5x5)', fontsize=14, fontweight='bold', y=1.02)
+    title = 'Self-Prediction vs Cross-Prediction (5x5)'
+    if subtitle:
+        title += f'\n{subtitle}'
+    fig.suptitle(title, fontsize=13, fontweight='bold', y=1.03)
 
-    im1 = ax1.imshow(-raw_mse, cmap='viridis', aspect='auto')
-    ax1.set_title('Negative MSE - Raw\n(yellow = better)', fontsize=12)
+    im1 = ax1.imshow(spearman_jitter, cmap='viridis', aspect='auto')
+    ax1.set_title('Spearman ρ — jittered tie-breaking\n(yellow = better)', fontsize=12)
     for i in range(n):
         for j in range(n):
-            if not np.isnan(raw_mse[i, j]):
-                ax1.text(j, i, f'{raw_mse[i,j]:.2f}', ha='center', va='center',
+            if not np.isnan(spearman_jitter[i, j]):
+                ax1.text(j, i, f'{spearman_jitter[i,j]:.2f}', ha='center', va='center',
                          fontsize=10, fontweight='bold' if i == j else 'normal', color='black')
     plt.colorbar(im1, ax=ax1, shrink=0.8)
 
-    im2 = ax2.imshow(-z_mse, cmap='viridis', aspect='auto')
-    ax2.set_title('Negative MSE - Z-scored\n(yellow = better)', fontsize=12)
+    im2 = ax2.imshow(r2_matrix, cmap='viridis', aspect='auto')
+    ax2.set_title('R²\n(yellow = better)', fontsize=12)
     for i in range(n):
         for j in range(n):
-            if not np.isnan(z_mse[i, j]):
-                ax2.text(j, i, f'{z_mse[i,j]:.2f}', ha='center', va='center',
+            if not np.isnan(r2_matrix[i, j]):
+                ax2.text(j, i, f'{r2_matrix[i,j]:.2f}', ha='center', va='center',
                          fontsize=10, fontweight='bold' if i == j else 'normal', color='black')
     plt.colorbar(im2, ax=ax2, shrink=0.8)
 
@@ -88,47 +119,7 @@ def plot_mse_heatmaps(raw_mse, z_mse):
         ax.set_ylabel('Predictor')
 
     plt.tight_layout()
-    out = OUTPUT_DIR / 'self_vs_cross_plot.png'
-    plt.savefig(out, dpi=150, bbox_inches='tight')
-    print(f'Saved {out}')
-    plt.close()
-
-
-def plot_mse_and_spearman(raw_mse, spearman):
-    labels = [short(m) for m in MODELS]
-    n = len(MODELS)
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle('Self-Prediction vs Cross-Prediction (5x5)', fontsize=14, fontweight='bold', y=1.02)
-
-    im1 = ax1.imshow(-raw_mse, cmap='viridis', aspect='auto')
-    ax1.set_title('Negative MSE\n(yellow = better)', fontsize=12)
-    for i in range(n):
-        for j in range(n):
-            if not np.isnan(raw_mse[i, j]):
-                ax1.text(j, i, f'{raw_mse[i,j]:.2f}', ha='center', va='center',
-                         fontsize=10, fontweight='bold' if i == j else 'normal', color='black')
-    plt.colorbar(im1, ax=ax1, shrink=0.8)
-
-    im2 = ax2.imshow(spearman, cmap='viridis', aspect='auto')
-    ax2.set_title('Spearman ρ\n(yellow = better)', fontsize=12)
-    for i in range(n):
-        for j in range(n):
-            if not np.isnan(spearman[i, j]):
-                ax2.text(j, i, f'{spearman[i,j]:.2f}', ha='center', va='center',
-                         fontsize=10, fontweight='bold' if i == j else 'normal', color='black')
-    plt.colorbar(im2, ax=ax2, shrink=0.8)
-
-    for ax in (ax1, ax2):
-        ax.set_xticks(range(n))
-        ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=10)
-        ax.set_yticks(range(n))
-        ax.set_yticklabels(labels, fontsize=10)
-        ax.set_xlabel('Target')
-        ax.set_ylabel('Predictor')
-
-    plt.tight_layout()
-    out = OUTPUT_DIR / 'self_vs_cross_mse_spearman.png'
+    out = OUTPUT_DIR / 'self_vs_cross_main.png'
     plt.savefig(out, dpi=150, bbox_inches='tight')
     print(f'Saved {out}')
     plt.close()
@@ -187,20 +178,25 @@ def main():
     for _, row in gt_df.iterrows():
         gt[(row['target_model'], row['character'], row['metric_key'])] = row['ground_truth_score']
 
-    raw_mse, z_mse, spearman = compute_matrices(preds, gt)
-    plot_mse_heatmaps(raw_mse, z_mse)
-    plot_mse_and_spearman(raw_mse, spearman)
+    has_target_col = 'target_model' in preds.columns
+    subtitle = '(jitter=±0.001, 500 runs)'
+    if has_target_col:
+        subtitle = 'named-model variant — ' + subtitle
+
+    raw_mse, z_mse, spearman_jitter, r2_matrix = compute_matrices(preds, gt)
+    plot_main(spearman_jitter, r2_matrix, subtitle=subtitle)
     plot_calibration(preds, gt_df)
 
     # Print summary
     n = len(MODELS)
-    diag_raw = np.mean([raw_mse[i, i] for i in range(n)])
-    off_raw = np.mean([raw_mse[i, j] for i in range(n) for j in range(n) if i != j])
-    diag_z = np.mean([z_mse[i, i] for i in range(n)])
-    off_z = np.mean([z_mse[i, j] for i in range(n) for j in range(n) if i != j])
 
-    print(f"\nRaw MSE:     self={diag_raw:.3f}  cross={off_raw:.3f}  delta={off_raw-diag_raw:+.3f}")
-    print(f"Z-scored MSE: self={diag_z:.3f}  cross={off_z:.3f}  delta={off_z-diag_z:+.3f}")
+    diag_sp = np.mean([spearman_jitter[i, i] for i in range(n)])
+    off_sp  = np.mean([spearman_jitter[i, j] for i in range(n) for j in range(n) if i != j])
+    diag_r2 = np.mean([r2_matrix[i, i] for i in range(n)])
+    off_r2  = np.mean([r2_matrix[i, j] for i in range(n) for j in range(n) if i != j])
+
+    print(f"\nSpearman ρ (jittered): self={diag_sp:.3f}  cross={off_sp:.3f}  delta={diag_sp-off_sp:+.3f}")
+    print(f"R²:                    self={diag_r2:.3f}  cross={off_r2:.3f}  delta={diag_r2-off_r2:+.3f}")
 
 
 if __name__ == "__main__":
