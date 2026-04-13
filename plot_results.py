@@ -135,7 +135,7 @@ def plot_calibration(preds: pd.DataFrame, gt_df: pd.DataFrame):
 
     predicted_means = []
     for m in MODELS:
-        sub = preds[preds['predictor_model'] == m]
+        sub = preds[(preds['predictor_model'] == m) & (preds['target_model'] == m)]
         predicted_means.append(sub['predicted_score'].mean())
 
     data = np.array([actual_means, predicted_means])
