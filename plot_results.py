@@ -6,7 +6,9 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.stats import spearmanr, zscore
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.stats import spearmanr, zscore, rankdata
 from pathlib import Path
 import glob
 
@@ -162,6 +164,99 @@ def plot_calibration(preds: pd.DataFrame, gt_df: pd.DataFrame):
     plt.close()
 
 
+def plot_scatter_interactive(preds: pd.DataFrame, gt: dict, by_rank=False):
+    """Interactive Plotly scatter: predicted vs actual for each model's self-predictions."""
+    labels = [short(m) for m in MODELS]
+    suffix = "rank" if by_rank else "score"
+
+    fig = make_subplots(
+        rows=1, cols=len(MODELS),
+        subplot_titles=[f"{l} (self)" for l in labels],
+        shared_yaxes=True,
+    )
+
+    for idx, model in enumerate(MODELS):
+        label = short(model)
+        if 'target_model' in preds.columns:
+            sub = preds[
+                (preds['predictor_model'] == model) &
+                (preds['target_model'] == model) &
+                preds['predicted_score'].notna()
+            ]
+        else:
+            sub = preds[
+                (preds['predictor_model'] == model) &
+                preds['predicted_score'].notna()
+            ]
+
+        predicted, actual, hover = [], [], []
+        for _, row in sub.iterrows():
+            key = (model, row['character'], row['metric_key'])
+            if key in gt:
+                predicted.append(row['predicted_score'])
+                actual.append(gt[key])
+                hover.append(f"{row['character']}<br>{row['metric_key']}")
+
+        if not predicted:
+            continue
+
+        predicted, actual = np.array(predicted), np.array(actual)
+
+        if by_rank:
+            predicted = rankdata(predicted)
+            actual = rankdata(actual)
+
+        rho, _ = spearmanr(predicted, actual)
+        ss_res = np.sum((actual - predicted) ** 2)
+        ss_tot = np.sum((actual - actual.mean()) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float('nan')
+
+        fig.add_trace(
+            go.Scatter(
+                x=actual, y=predicted,
+                mode='markers',
+                text=hover,
+                hovertemplate='%{text}<br>Actual: %{x:.2f}<br>Predicted: %{y:.2f}<extra></extra>',
+                marker=dict(size=6, opacity=0.7),
+                name=label,
+            ),
+            row=1, col=idx + 1,
+        )
+
+        # diagonal reference line
+        all_vals = np.concatenate([predicted, actual])
+        lo, hi = all_vals.min(), all_vals.max()
+        fig.add_trace(
+            go.Scatter(x=[lo, hi], y=[lo, hi], mode='lines',
+                       line=dict(dash='dash', color='gray'), showlegend=False),
+            row=1, col=idx + 1,
+        )
+
+        axis_label = "Rank" if by_rank else "Score"
+        fig.update_xaxes(title_text=f"Actual {axis_label}", row=1, col=idx + 1)
+        if idx == 0:
+            fig.update_yaxes(title_text=f"Predicted {axis_label}", row=1, col=idx + 1)
+
+        xref = "x domain" if idx == 0 else f"x{idx + 1} domain"
+        yref = "y domain" if idx == 0 else f"y{idx + 1} domain"
+        fig.add_annotation(
+            x=0.5, y=-0.15,
+            xref=xref, yref=yref,
+            text=f"ρ={rho:.2f}  R²={r2:.2f}",
+            showarrow=False, font=dict(size=11),
+        )
+
+    title = f"Self-Prediction Scatter ({'Rank' if by_rank else 'Score'})"
+    fig.update_layout(
+        title_text=title, height=450, width=350 * len(MODELS),
+        showlegend=False,
+    )
+
+    out = OUTPUT_DIR / f'self_prediction_scatter_{suffix}.html'
+    fig.write_html(str(out))
+    print(f'Saved {out}')
+
+
 def main():
     stage2_dir = Path(__file__).parent / "stage2_results"
 
@@ -186,6 +281,8 @@ def main():
     raw_mse, z_mse, spearman_jitter, r2_matrix = compute_matrices(preds, gt)
     plot_main(spearman_jitter, r2_matrix, subtitle=subtitle)
     plot_calibration(preds, gt_df)
+    plot_scatter_interactive(preds, gt, by_rank=False)
+    plot_scatter_interactive(preds, gt, by_rank=True)
 
     # Print summary
     n = len(MODELS)
