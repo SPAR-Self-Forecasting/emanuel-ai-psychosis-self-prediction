@@ -1,6 +1,7 @@
 ai-psychosis/
 instructions.txt
 backup_full_models/
+backup_full_models/
 __pycache__/
 *.pyc
 venv/
